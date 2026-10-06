@@ -14,7 +14,7 @@ The pipeline includes data cleaning, preprocessing, model training, and evaluati
 ### Installation
 1. Clone the repository:
 
-git clone https://github.com/yourusername/yourreponame.git
+git clone https://github.com/jjwongjun/resale-transactions.git
 cd hdb-resale-price-prediction
 
 2. Create and activate a conda environment:
