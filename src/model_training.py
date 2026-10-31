@@ -4,7 +4,10 @@ from typing import Any, Dict, Tuple
 
 # Related third-party imports
 import pandas as pd
+from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import Lasso, LinearRegression, Ridge
 from sklearn.metrics import (
     mean_absolute_error,
@@ -12,7 +15,7 @@ from sklearn.metrics import (
     r2_score,
     root_mean_squared_error,
 )
-from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.model_selection import GridSearchCV, cross_validate, train_test_split
 from sklearn.pipeline import Pipeline
 
 
@@ -57,13 +60,17 @@ class ModelTraining:
         Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]: A tuple containing the training, validation, and test features and target variables.
         """
         logging.info("Starting data splitting.")
+        if self.config["target_column"] not in df.columns:
+            raise ValueError(f"Target column '{self.config['target_column']}' not found.")
         X = df.drop(columns=self.config["target_column"])
         y = df[self.config["target_column"]]
         X_train, X_temp, y_train, y_temp = train_test_split(
-            X, y, test_size=self.config["val_test_size"], random_state=42
+            X, y, test_size=self.config["val_test_size"],
+            random_state=self.config.get("random_state", 42),
         )
         X_val, X_test, y_val, y_test = train_test_split(
-            X_temp, y_temp, test_size=self.config["val_size"], random_state=42
+            X_temp, y_temp, test_size=self.config["val_size"],
+            random_state=self.config.get("random_state", 42),
         )
         logging.info("Data split into train, validation, test sets.")
         return X_train, X_val, X_test, y_train, y_val, y_test
@@ -90,10 +97,16 @@ class ModelTraining:
         Tuple[Dict[str, Pipeline], Dict[str, Dict[str, float]]]: A tuple containing the trained pipelines and their evaluation metrics.
         """
         logging.info("Training and evaluating baseline models.")
+        seed = self.config.get("random_state", 42)
         models = {
             "linear_regression": LinearRegression(),
             "ridge": Ridge(),
             "lasso": Lasso(),
+            # Tree-based models can capture non-linear relationships
+            "random_forest": RandomForestRegressor(
+                n_estimators=100, n_jobs=-1, random_state=seed
+            ),
+            "hist_gradient_boosting": HistGradientBoostingRegressor(random_state=seed),
         }
         pipelines = {}
         metrics = {}
@@ -134,13 +147,21 @@ class ModelTraining:
         logging.info("Starting hyperparameter tuning.")
         tuned_models = {}
         tuned_metrics = {}
-        param_grid = self.config["param_grid"]
         cv = self.config["cv"]
         scoring = self.config["scoring"]
+        seed = self.config.get("random_state", 42)
 
-        models = {"ridge_tuned": Ridge(), "lasso_tuned": Lasso()}
+        # Each model is paired with its own hyperparameter grid
+        models = {
+            "ridge_tuned": (Ridge(), self.config["param_grid"]),
+            "lasso_tuned": (Lasso(), self.config["param_grid"]),
+            "hist_gradient_boosting_tuned": (
+                HistGradientBoostingRegressor(random_state=seed),
+                self.config["tree_param_grid"],
+            ),
+        }
 
-        for model_name, model in models.items():
+        for model_name, (model, param_grid) in models.items():
             pipeline = Pipeline(
                 steps=[("preprocessor", self.preprocessor), ("regressor", model)]
             )
@@ -148,7 +169,9 @@ class ModelTraining:
                 pipeline, param_grid, cv=cv, scoring=scoring, n_jobs=-1
             )
             grid_search.fit(X_train, y_train)
+            logging.info(f"{model_name} best parameters: {grid_search.best_params_}")
             tuned_models[model_name] = grid_search.best_estimator_
+            self._log_cv_summary(tuned_models[model_name], X_train, y_train, model_name)
             tuned_metrics[model_name] = self._evaluate_model(
                 tuned_models[model_name], X_val, y_val, model_name + " (tuned)"
             )
@@ -185,6 +208,95 @@ class ModelTraining:
             logging.info(f"{metric_name}: {metric_value}")
         return metrics
 
+    def retrain_on_train_val(
+        self,
+        model: Pipeline,
+        X_train: pd.DataFrame,
+        X_val: pd.DataFrame,
+        y_train: pd.Series,
+        y_val: pd.Series,
+    ) -> Pipeline:
+        """
+        Retrain the selected model (same hyperparameters) on train + validation data.
+
+        Args:
+        -----
+        model (Pipeline): The selected model pipeline.
+        X_train, X_val (pd.DataFrame): The training and validation features.
+        y_train, y_val (pd.Series): The training and validation target variables.
+
+        Returns:
+        --------
+        Pipeline: A new pipeline fitted on the combined data.
+        """
+        logging.info("Retraining best model on training + validation data.")
+        final_model = clone(model)
+        final_model.fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val]))
+        return final_model
+
+    def log_feature_importance(
+        self, model: Pipeline, X_test: pd.DataFrame, y_test: pd.Series
+    ) -> pd.Series:
+        """
+        Log permutation importance (drop in R² when a feature is shuffled) on the
+        test set. Works for both linear and tree-based models.
+
+        Args:
+        -----
+        model (Pipeline): The trained model pipeline.
+        X_test (pd.DataFrame): The test features.
+        y_test (pd.Series): The test target variable.
+
+        Returns:
+        --------
+        pd.Series: Feature importances sorted from most to least important.
+        """
+        result = permutation_importance(
+            model,
+            X_test,
+            y_test,
+            n_repeats=5,
+            scoring="r2",
+            random_state=self.config.get("random_state", 42),
+            n_jobs=-1,
+        )
+        importances = pd.Series(result.importances_mean, index=X_test.columns)
+        importances = importances.sort_values(ascending=False)
+        logging.info(f"Permutation feature importance:\n{importances.round(4)}")
+        return importances
+
+    def _log_cv_summary(
+        self, model: Pipeline, X_train: pd.DataFrame, y_train: pd.Series, model_name: str
+    ) -> None:
+        """
+        Log the mean and standard deviation of R², MAE and RMSE across CV folds.
+
+        Args:
+        -----
+        model (Pipeline): The model pipeline (with its best hyperparameters).
+        X_train (pd.DataFrame): The training features.
+        y_train (pd.Series): The training target variable.
+        model_name (str): The name of the model being evaluated.
+        """
+        scores = cross_validate(
+            model,
+            X_train,
+            y_train,
+            cv=self.config["cv"],
+            scoring={
+                "R²": "r2",
+                "MAE": "neg_mean_absolute_error",
+                "RMSE": "neg_root_mean_squared_error",
+            },
+            n_jobs=-1,
+        )
+        logging.info(f"{model_name} {self.config['cv']}-fold CV results:")
+        for metric in ["R²", "MAE", "RMSE"]:
+            values = scores[f"test_{metric}"]
+            if metric != "R²":
+                values = -values
+            logging.info(f"{metric}: {values.mean():.4f} (+/- {values.std():.4f})")
+
     def _evaluate_model(
         self, model: Pipeline, X_val: pd.DataFrame, y_val: pd.Series, model_name: str
     ) -> Dict[str, float]:
@@ -212,4 +324,4 @@ class ModelTraining:
         logging.info(f"{model_name} Validation Metrics:")
         for metric_name, metric_value in metrics.items():
             logging.info(f"{metric_name}: {metric_value}")
-        return metrics
+        return metrics

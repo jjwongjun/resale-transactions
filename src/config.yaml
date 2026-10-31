@@ -2,9 +2,13 @@ file_path: './data/resale_transactions.csv'
 target_column: resale_price
 val_test_size: 0.2
 val_size: 0.5
+random_state: 42
 param_grid:
   regressor__alpha: [0.1, 1, 10, 100, 1000]
   regressor__fit_intercept: [True, False]
+tree_param_grid:
+  regressor__learning_rate: [0.05, 0.1]
+  regressor__max_iter: [200, 400]
 cv: 5
 scoring: r2
 numerical_features:
@@ -27,4 +31,4 @@ flat_type_categories:
   - 4 ROOM
   - 5 ROOM
   - MULTI-GENERATION
-  - EXECUTIVE
+  - EXECUTIVE
